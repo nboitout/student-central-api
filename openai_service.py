@@ -16,7 +16,7 @@ def get_openai_client() -> AzureOpenAI:
 
 
 def get_deployment() -> str:
-    return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+    return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2-chat")
 
 
 async def generate_mcq(course_title: str, pdf_sas_url: str | None, course_id: str) -> MCQQuestion:
