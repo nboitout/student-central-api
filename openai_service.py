@@ -1,85 +1,178 @@
-from fastapi import APIRouter, HTTPException
-from models.mcq import MCQGenerateRequest, MCQEvaluateRequest
-from services import openai_service, cosmos_service
-from services.blob_service import get_blob_sas_url
-
-router = APIRouter(prefix="/api/mcq", tags=["mcq"])
+import os
+import json
+from openai import AzureOpenAI
+from models.mcq import MCQQuestion, MCQOption, ReasoningSignal
 
 
-@router.post("/generate")
-async def generate_mcq(payload: MCQGenerateRequest):
+def get_openai_client() -> AzureOpenAI:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    # Use the new v1 API — append /openai/v1 to the endpoint
+    base_url = endpoint.rstrip("/") + "/openai/v1/"
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),
+        api_version="2025-04-01-preview",  # latest stable, v1 auto-updates beyond this
+    )
+
+
+def get_deployment() -> str:
+    return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+
+
+async def generate_mcq(course_title: str, pdf_sas_url: str | None, course_id: str) -> MCQQuestion:
     """
-    Generate one MCQ question for a given course.
-    If the course has a PDF attached, uses it as context for GPT-4o.
-    Falls back to course title only if no PDF is available.
+    Generate one MCQ question from the course PDF (or title if no PDF).
+    Returns a structured MCQQuestion with 4 options, correct index, and explanation.
     """
-    # Fetch course to get PDF URL if not provided
-    pdf_sas_url = None
+    client = get_openai_client()
+    deployment = get_deployment()
 
-    if payload.pdfUrl:
-        # Generate a short-lived SAS URL for secure GPT-4o access
-        try:
-            pdf_sas_url = get_blob_sas_url(payload.pdfUrl)
-        except Exception:
-            # If SAS generation fails, proceed without PDF
-            pdf_sas_url = None
-    elif payload.courseId:
-        course = await cosmos_service.get_course(payload.courseId)
-        if course and course.get("pdfUrl"):
-            try:
-                pdf_sas_url = get_blob_sas_url(course["pdfUrl"])
-            except Exception:
-                pdf_sas_url = None
+    # Build the prompt — with or without PDF
+    if pdf_sas_url:
+        system_prompt = """You are an expert academic assessment designer.
+You will receive a PDF document from a university course.
+Your task is to generate ONE high-quality multiple-choice question that:
+- Tests conceptual understanding, not just recall
+- Has exactly 4 options (A, B, C, D)
+- Has one clearly correct answer
+- Has plausible distractors that target common misconceptions
+- Is appropriate for a master's level student
 
-    # Determine course title
-    course_title = payload.courseTitle
-    if not course_title and payload.courseId:
-        course = await cosmos_service.get_course(payload.courseId)
-        if course:
-            course_title = course.get("title", "")
+Respond ONLY with valid JSON in this exact format, no other text:
+{
+  "question": "...",
+  "options": ["option A text", "option B text", "option C text", "option D text"],
+  "correctIndex": 0,
+  "explanation": "Clear explanation of why the correct answer is right and why the others are wrong."
+}"""
 
-    if not course_title:
-        raise HTTPException(status_code=400, detail="Course title or courseId is required.")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Generate one MCQ for this course: '{course_title}'. Use the PDF content provided.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": pdf_sas_url},
+                    },
+                ],
+            },
+        ]
+    else:
+        system_prompt = """You are an expert academic assessment designer.
+Generate ONE high-quality multiple-choice question for the given course title.
+The question should test conceptual understanding at master's level.
 
-    try:
-        mcq = await openai_service.generate_mcq(
-            course_title=course_title,
-            pdf_sas_url=pdf_sas_url,
-            course_id=payload.courseId,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate MCQ: {str(e)}"
-        )
+Respond ONLY with valid JSON in this exact format, no other text:
+{
+  "question": "...",
+  "options": ["option A text", "option B text", "option C text", "option D text"],
+  "correctIndex": 0,
+  "explanation": "Clear explanation of why the correct answer is right and why the others are wrong."
+}"""
 
-    return mcq
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Generate one MCQ for this university course: '{course_title}'",
+            },
+        ]
+
+    response = client.chat.completions.create(
+        model=deployment,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=800,
+        response_format={"type": "json_object"},
+    )
+
+    raw = json.loads(response.choices[0].message.content)
+
+    options = [
+        MCQOption(letter=["A", "B", "C", "D"][i], text=opt)
+        for i, opt in enumerate(raw["options"])
+    ]
+
+    return MCQQuestion(
+        question=raw["question"],
+        options=options,
+        correctIndex=raw["correctIndex"],
+        explanation=raw["explanation"],
+        courseId=course_id,
+    )
 
 
-@router.post("/evaluate")
-async def evaluate_reasoning(payload: MCQEvaluateRequest):
+async def evaluate_reasoning(
+    question: str,
+    options: list[str],
+    correct_index: int,
+    selected_index: int,
+    student_explanation: str | None,
+) -> ReasoningSignal:
     """
-    Evaluate the quality of a student's reasoning after an MCQ answer.
-    Returns a reasoning signal: Strong / Fragile / Partial misconception / Low mastery.
+    Evaluate the quality of a student's reasoning.
+    Returns a ReasoningSignal: Strong / Fragile / Partial misconception / Low mastery.
     """
-    if not payload.studentExplanation or len(payload.studentExplanation.strip()) < 10:
-        raise HTTPException(
-            status_code=400,
-            detail="A written explanation of at least 10 characters is required for evaluation."
-        )
+    client = get_openai_client()
+    deployment = get_deployment()
 
-    try:
-        signal = await openai_service.evaluate_reasoning(
-            question=payload.question,
-            options=payload.options,
-            correct_index=payload.correctIndex,
-            selected_index=payload.selectedIndex,
-            student_explanation=payload.studentExplanation,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to evaluate reasoning: {str(e)}"
-        )
+    is_correct = selected_index == correct_index
+    selected_option = options[selected_index] if selected_index < len(options) else "unknown"
+    correct_option = options[correct_index]
 
-    return signal
+    system_prompt = """You are an expert educational psychologist evaluating student reasoning quality.
+You will receive a multiple-choice question, the student's selected answer, and their written explanation.
+Your job is to classify the quality of the student's understanding into one of four categories:
+
+- "Strong": Student selected correctly AND explanation shows deep understanding of the underlying concept
+- "Fragile": Student selected correctly BUT explanation is weak, vague, or suggests guessing/pattern matching
+- "Partial misconception": Student selected incorrectly BUT explanation shows partial understanding worth building on
+- "Low mastery": Student selected incorrectly AND explanation shows fundamental confusion or lack of understanding
+
+Respond ONLY with valid JSON in this exact format, no other text:
+{
+  "signal": "Strong" | "Fragile" | "Partial misconception" | "Low mastery",
+  "confidence": "High" | "Medium" | "Low",
+  "facultyInsight": "2-3 sentences for the faculty dashboard describing what this student's response reveals about their understanding.",
+  "studentFeedback": "2-3 sentences of personalised, constructive feedback for the student."
+}"""
+
+    user_content = f"""Question: {question}
+
+Options:
+A: {options[0] if len(options) > 0 else ""}
+B: {options[1] if len(options) > 1 else ""}
+C: {options[2] if len(options) > 2 else ""}
+D: {options[3] if len(options) > 3 else ""}
+
+Correct answer: {correct_option}
+Student selected: {selected_option} ({"CORRECT" if is_correct else "INCORRECT"})
+
+Student's explanation: {student_explanation or "No explanation provided."}
+
+Evaluate the quality of this student's reasoning."""
+
+    response = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.3,
+        max_tokens=500,
+        response_format={"type": "json_object"},
+    )
+
+    raw = json.loads(response.choices[0].message.content)
+
+    return ReasoningSignal(
+        signal=raw["signal"],
+        confidence=raw["confidence"],
+        facultyInsight=raw["facultyInsight"],
+        studentFeedback=raw["studentFeedback"],
+    )
