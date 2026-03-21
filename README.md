@@ -27,5 +27,9 @@ env/
 .DS_Store
 Thumbs.db
 
+## Status
+Backend deployed on Azure Container Apps.
+
+
 # Docker
 *.log
