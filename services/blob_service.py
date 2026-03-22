@@ -1,85 +1,75 @@
-from fastapi import APIRouter, HTTPException
-from models.mcq import MCQGenerateRequest, MCQEvaluateRequest
-from services import openai_service, cosmos_service
-from services.blob_service import get_blob_sas_url
-
-router = APIRouter(prefix="/api/mcq", tags=["mcq"])
+import os
+import uuid
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from datetime import datetime, timedelta, timezone
 
 
-@router.post("/generate")
-async def generate_mcq(payload: MCQGenerateRequest):
+def get_blob_client() -> BlobServiceClient:
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if not connection_string:
+        raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not set")
+    return BlobServiceClient.from_connection_string(connection_string)
+
+
+def get_container_name() -> str:
+    return os.getenv("AZURE_STORAGE_CONTAINER_NAME", "course-pdfs")
+
+
+async def upload_pdf(file_bytes: bytes, original_filename: str, user_id: str = "nicolas") -> str:
     """
-    Generate one MCQ question for a given course.
-    If the course has a PDF attached, uses it as context for GPT-4o.
-    Falls back to course title only if no PDF is available.
+    Upload a PDF to Azure Blob Storage.
+    Returns the permanent blob URL.
     """
-    # Fetch course to get PDF URL if not provided
-    pdf_sas_url = None
+    client = get_blob_client()
+    container = get_container_name()
 
-    if payload.pdfUrl:
-        # Generate a short-lived SAS URL for secure GPT-4o access
-        try:
-            pdf_sas_url = get_blob_sas_url(payload.pdfUrl)
-        except Exception:
-            # If SAS generation fails, proceed without PDF
-            pdf_sas_url = None
-    elif payload.courseId:
-        course = await cosmos_service.get_course(payload.courseId)
-        if course and course.get("pdfUrl"):
-            try:
-                pdf_sas_url = get_blob_sas_url(course["pdfUrl"])
-            except Exception:
-                pdf_sas_url = None
+    # Generate a unique blob name to avoid collisions
+    ext = original_filename.rsplit(".", 1)[-1] if "." in original_filename else "pdf"
+    blob_name = f"{user_id}/{uuid.uuid4()}.{ext}"
 
-    # Determine course title
-    course_title = payload.courseTitle
-    if not course_title and payload.courseId:
-        course = await cosmos_service.get_course(payload.courseId)
-        if course:
-            course_title = course.get("title", "")
+    blob_client = client.get_blob_client(container=container, blob=blob_name)
+    blob_client.upload_blob(
+        file_bytes,
+        overwrite=True,
+        content_settings={"content_type": "application/pdf"}
+    )
 
-    if not course_title:
-        raise HTTPException(status_code=400, detail="Course title or courseId is required.")
+    return blob_client.url
 
+
+def get_blob_sas_url(blob_url: str, expiry_hours: int = 2) -> str:
+    """
+    Generate a short-lived SAS URL for secure access to a private blob.
+    Use this when passing the PDF URL to Azure OpenAI for reading.
+    """
+    client = get_blob_client()
+    account_name = client.account_name
+    account_key = client.credential.account_key
+    container = get_container_name()
+
+    # Extract blob name from URL
+    blob_name = blob_url.split(f"{container}/")[-1]
+
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+    )
+
+    return f"{blob_url}?{sas_token}"
+
+
+async def delete_blob(blob_url: str) -> bool:
+    """Delete a blob by its URL."""
     try:
-        mcq = await openai_service.generate_mcq(
-            course_title=course_title,
-            pdf_sas_url=pdf_sas_url,
-            course_id=payload.courseId,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate MCQ: {str(e)}"
-        )
-
-    return mcq
-
-
-@router.post("/evaluate")
-async def evaluate_reasoning(payload: MCQEvaluateRequest):
-    """
-    Evaluate the quality of a student's reasoning after an MCQ answer.
-    Returns a reasoning signal: Strong / Fragile / Partial misconception / Low mastery.
-    """
-    if not payload.studentExplanation or len(payload.studentExplanation.strip()) < 10:
-        raise HTTPException(
-            status_code=400,
-            detail="A written explanation of at least 10 characters is required for evaluation."
-        )
-
-    try:
-        signal = await openai_service.evaluate_reasoning(
-            question=payload.question,
-            options=payload.options,
-            correct_index=payload.correctIndex,
-            selected_index=payload.selectedIndex,
-            student_explanation=payload.studentExplanation,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to evaluate reasoning: {str(e)}"
-        )
-
-    return signal
+        client = get_blob_client()
+        container = get_container_name()
+        blob_name = blob_url.split(f"{container}/")[-1].split("?")[0]
+        blob_client = client.get_blob_client(container=container, blob=blob_name)
+        blob_client.delete_blob()
+        return True
+    except Exception:
+        return False
