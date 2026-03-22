@@ -32,4 +32,8 @@ Backend deployed on Azure Container Apps.
 
 
 # Docker
+
+
+<!-- rebuild -->
+
 *.log
