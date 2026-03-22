@@ -1,18 +1,50 @@
-# Azure Blob Storage
-AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=studentcentralstore;AccountKey=...;EndpointSuffix=core.windows.net
-AZURE_STORAGE_CONTAINER_NAME=course-pdfs
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+import os
 
-# Azure Cosmos DB
-AZURE_COSMOS_ENDPOINT=https://student-central-db.documents.azure.com:443/
-AZURE_COSMOS_KEY=your-primary-key-here
-AZURE_COSMOS_DATABASE=student-central
-AZURE_COSMOS_CONTAINER=courses
+from routers import upload, courses, mcq
 
-# Azure OpenAI
-AZURE_OPENAI_ENDPOINT=https://student-central-aoai.openai.azure.com/
-AZURE_OPENAI_API_KEY=your-api-key-here
-AZURE_OPENAI_DEPLOYMENT=gpt-4o
-AZURE_OPENAI_API_VERSION=2024-08-01-preview
+load_dotenv()
 
-# CORS — comma-separated list of allowed frontend origins
-ALLOWED_ORIGINS=https://student-central.vercel.app,http://localhost:3000
+app = FastAPI(
+    title="Student Central API",
+    description="Backend API for Student Central — reasoning-aware assessment platform",
+    version="1.0.0",
+)
+
+allowed_origins_raw = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000"
+)
+allowed_origins = [o.strip() for o in allowed_origins_raw.split(",")]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(upload.router)
+app.include_router(courses.router)
+app.include_router(mcq.router)
+
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "student-central-api",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/", tags=["health"])
+async def root():
+    return {
+        "message": "Student Central API is running.",
+        "docs": "/docs",
+        "health": "/health",
+    }
