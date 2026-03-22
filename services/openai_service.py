@@ -83,7 +83,6 @@ Respond ONLY with valid JSON in this exact format, no other text:
     response = client.chat.completions.create(
         model=deployment,
         messages=messages,
-        temperature=0.7,
         max_completion_tokens=800,
         response_format={"type": "json_object"},
     )
@@ -160,8 +159,7 @@ Evaluate the quality of this student's reasoning."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.3,
-        max_tokens=500,
+        max_completion_tokens=500,
         response_format={"type": "json_object"},
     )
 
