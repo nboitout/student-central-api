@@ -1,6 +1,6 @@
 import os
 import uuid
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
 from datetime import datetime, timedelta, timezone
 
 
@@ -31,7 +31,7 @@ async def upload_pdf(file_bytes: bytes, original_filename: str, user_id: str = "
     blob_client.upload_blob(
         file_bytes,
         overwrite=True,
-        content_settings={"content_type": "application/pdf"}
+        content_settings=ContentSettings(content_type="application/pdf")
     )
 
     return blob_client.url
