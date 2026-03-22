@@ -1,75 +1,82 @@
 import os
-import uuid
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-from datetime import datetime, timedelta, timezone
+from azure.cosmos import CosmosClient, PartitionKey, exceptions
+from models.course import Course, CourseUpdate
+from datetime import datetime
 
 
-def get_blob_client() -> BlobServiceClient:
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    if not connection_string:
-        raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not set")
-    return BlobServiceClient.from_connection_string(connection_string)
+def get_cosmos_client():
+    endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")
+    key = os.getenv("AZURE_COSMOS_KEY")
+    if not endpoint or not key:
+        raise ValueError("Cosmos DB credentials are not set")
+    return CosmosClient(endpoint, credential=key)
 
 
-def get_container_name() -> str:
-    return os.getenv("AZURE_STORAGE_CONTAINER_NAME", "course-pdfs")
+def get_container():
+    client = get_cosmos_client()
+    db_name = os.getenv("AZURE_COSMOS_DATABASE", "student-central")
+    container_name = os.getenv("AZURE_COSMOS_CONTAINER", "courses")
+    database = client.get_database_client(db_name)
+    return database.get_container_client(container_name)
 
 
-async def upload_pdf(file_bytes: bytes, original_filename: str, user_id: str = "nicolas") -> str:
-    """
-    Upload a PDF to Azure Blob Storage.
-    Returns the permanent blob URL.
-    """
-    client = get_blob_client()
-    container = get_container_name()
+async def create_course(course: Course) -> dict:
+    """Insert a new course document into Cosmos DB."""
+    container = get_container()
+    item = course.model_dump()
+    container.create_item(body=item)
+    return item
 
-    # Generate a unique blob name to avoid collisions
-    ext = original_filename.rsplit(".", 1)[-1] if "." in original_filename else "pdf"
-    blob_name = f"{user_id}/{uuid.uuid4()}.{ext}"
 
-    blob_client = client.get_blob_client(container=container, blob=blob_name)
-    blob_client.upload_blob(
-        file_bytes,
-        overwrite=True,
-        content_settings={"content_type": "application/pdf"}
+async def list_courses(user_id: str = "nicolas") -> list[dict]:
+    """Return all courses for a given user, ordered by createdAt descending."""
+    container = get_container()
+    query = (
+        "SELECT * FROM c WHERE c.userId = @userId "
+        "ORDER BY c.createdAt DESC"
     )
-
-    return blob_client.url
-
-
-def get_blob_sas_url(blob_url: str, expiry_hours: int = 2) -> str:
-    """
-    Generate a short-lived SAS URL for secure access to a private blob.
-    Use this when passing the PDF URL to Azure OpenAI for reading.
-    """
-    client = get_blob_client()
-    account_name = client.account_name
-    account_key = client.credential.account_key
-    container = get_container_name()
-
-    # Extract blob name from URL
-    blob_name = blob_url.split(f"{container}/")[-1]
-
-    sas_token = generate_blob_sas(
-        account_name=account_name,
-        container_name=container,
-        blob_name=blob_name,
-        account_key=account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
-    )
-
-    return f"{blob_url}?{sas_token}"
+    params = [{"name": "@userId", "value": user_id}]
+    items = list(container.query_items(
+        query=query,
+        parameters=params,
+        enable_cross_partition_query=True,
+    ))
+    return items
 
 
-async def delete_blob(blob_url: str) -> bool:
-    """Delete a blob by its URL."""
+async def get_course(course_id: str, user_id: str = "nicolas") -> dict | None:
+    """Fetch a single course by ID."""
+    container = get_container()
     try:
-        client = get_blob_client()
-        container = get_container_name()
-        blob_name = blob_url.split(f"{container}/")[-1].split("?")[0]
-        blob_client = client.get_blob_client(container=container, blob=blob_name)
-        blob_client.delete_blob()
+        item = container.read_item(item=course_id, partition_key=user_id)
+        return item
+    except exceptions.CosmosResourceNotFoundError:
+        return None
+
+
+async def update_course(course_id: str, updates: CourseUpdate, user_id: str = "nicolas") -> dict | None:
+    """Patch a course with provided fields."""
+    container = get_container()
+    try:
+        item = container.read_item(item=course_id, partition_key=user_id)
+    except exceptions.CosmosResourceNotFoundError:
+        return None
+
+    if updates.status is not None:
+        item["status"] = updates.status
+    if updates.exercisesDone is not None:
+        item["exercisesDone"] = updates.exercisesDone
+
+    item["updatedAt"] = datetime.utcnow().isoformat()
+    container.replace_item(item=course_id, body=item)
+    return item
+
+
+async def delete_course(course_id: str, user_id: str = "nicolas") -> bool:
+    """Delete a course document."""
+    container = get_container()
+    try:
+        container.delete_item(item=course_id, partition_key=user_id)
         return True
-    except Exception:
+    except exceptions.CosmosResourceNotFoundError:
         return False
