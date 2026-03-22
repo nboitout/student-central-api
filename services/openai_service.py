@@ -84,7 +84,7 @@ Respond ONLY with valid JSON in this exact format, no other text:
         model=deployment,
         messages=messages,
         temperature=0.7,
-        max_tokens=800,
+        max_completion_tokens=800,
         response_format={"type": "json_object"},
     )
 
