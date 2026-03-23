@@ -1,5 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
+import uuid
+from datetime import datetime
 
 
 class MCQGenerateRequest(BaseModel):
@@ -21,6 +23,18 @@ class MCQQuestion(BaseModel):
     courseId: str
 
 
+class StoredMCQ(BaseModel):
+    """A single MCQ stored in the mcqs Cosmos DB container."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    courseId: str
+    userId: str = "nicolas"
+    question: str
+    options: list[MCQOption]
+    correctIndex: int
+    explanation: str
+    createdAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
 class MCQEvaluateRequest(BaseModel):
     courseId: str
     question: str
@@ -33,5 +47,5 @@ class MCQEvaluateRequest(BaseModel):
 class ReasoningSignal(BaseModel):
     signal: str          # "Strong" | "Fragile" | "Partial misconception" | "Low mastery"
     confidence: str      # "High" | "Medium" | "Low"
-    facultyInsight: str  # Human-readable explanation for the faculty dashboard
-    studentFeedback: str # Personalised feedback shown to the student
+    facultyInsight: str
+    studentFeedback: str
