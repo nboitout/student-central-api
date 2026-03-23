@@ -1,10 +1,10 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from azure.storage.blob import ContentSettings
 from services.blob_service import upload_pdf, get_blob_sas_url
 from services.pdf_service import render_pdf_pages_as_images
 from services.openai_service import generate_mcq_bank
 from services import cosmos_service
 from models.mcq import StoredMCQ
+from models.course import CourseUpdate
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 
@@ -26,8 +26,7 @@ async def _generate_and_store_mcqs(
         # Mark as generating
         await cosmos_service.update_course(
             course_id,
-            type("u", (), {"status": None, "exercisesDone": None, "allowDownload": None,
-                           "mcqStatus": "generating", "mcqCount": None})(),
+            CourseUpdate(mcqStatus="generating"),
             user_id=user_id,
         )
 
@@ -69,19 +68,18 @@ async def _generate_and_store_mcqs(
         # Update course: mcqStatus=ready, mcqCount=saved
         await cosmos_service.update_course(
             course_id,
-            type("u", (), {"status": None, "exercisesDone": None, "allowDownload": None,
-                           "mcqStatus": "ready", "mcqCount": saved_count})(),
+            CourseUpdate(mcqStatus="ready", mcqCount=saved_count),
             user_id=user_id,
         )
 
+        print(f"MCQ generation complete for course {course_id}: {saved_count} questions stored")
+
     except Exception as e:
-        # Mark as failed so the frontend can show an error state
         print(f"MCQ generation failed for course {course_id}: {e}")
         try:
             await cosmos_service.update_course(
                 course_id,
-                type("u", (), {"status": None, "exercisesDone": None, "allowDownload": None,
-                               "mcqStatus": "failed", "mcqCount": None})(),
+                CourseUpdate(mcqStatus="failed"),
                 user_id=user_id,
             )
         except Exception:
@@ -93,7 +91,6 @@ async def upload_course_pdf(file: UploadFile = File(...)):
     """
     Upload a PDF file to Azure Blob Storage.
     Returns the permanent blob URL to store with the course record.
-    MCQ generation is triggered separately after the course is created.
     """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
@@ -134,7 +131,7 @@ async def trigger_mcq_generation(
     Called by the frontend immediately after PATCH /api/courses/:id/pdf succeeds.
     Returns immediately — generation happens in the background.
     """
-    # Check if MCQs already exist for this course
+    # Check if MCQs already exist
     existing = await cosmos_service.get_mcq_bank(course_id)
     if existing:
         return {"status": "already_generated", "count": len(existing)}
