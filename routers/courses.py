@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from models.course import Course, CourseCreate, CourseUpdate
 from services import cosmos_service
-from services.blob_service import delete_blob
+from services.blob_service import delete_blob, get_blob_sas_url
 
 router = APIRouter(prefix="/api/courses", tags=["courses"])
 
@@ -48,17 +48,14 @@ async def update_course(course_id: str, updates: CourseUpdate, userId: str = "ni
 @router.delete("/{course_id}", status_code=204)
 async def delete_course(course_id: str, userId: str = "nicolas"):
     """Delete a course and its associated PDF from Blob Storage."""
-    # Fetch course first to get the PDF URL
     course = await cosmos_service.get_course(course_id, user_id=userId)
     if not course:
         raise HTTPException(status_code=404, detail="Course not found.")
 
-    # Delete from Cosmos DB
     deleted = await cosmos_service.delete_course(course_id, user_id=userId)
     if not deleted:
         raise HTTPException(status_code=404, detail="Course not found.")
 
-    # Also delete the PDF blob if it exists
     if course.get("pdfUrl"):
         await delete_blob(course["pdfUrl"])
 
@@ -67,10 +64,7 @@ async def delete_course(course_id: str, userId: str = "nicolas"):
 
 @router.patch("/{course_id}/pdf")
 async def attach_pdf(course_id: str, pdfUrl: str, userId: str = "nicolas"):
-    """
-    Attach a blob URL to an existing course after upload.
-    Called after POST /api/upload succeeds.
-    """
+    """Attach a blob URL to an existing course after upload."""
     course = await cosmos_service.get_course(course_id, user_id=userId)
     if not course:
         raise HTTPException(status_code=404, detail="Course not found.")
@@ -89,3 +83,28 @@ async def attach_pdf(course_id: str, pdfUrl: str, userId: str = "nicolas"):
     container.replace_item(item=course_id, body=course)
 
     return course
+
+
+@router.get("/{course_id}/pdf-url")
+async def get_pdf_sas_url(course_id: str, userId: str = "nicolas"):
+    """
+    Return a short-lived SAS URL for the course PDF.
+    The frontend uses this to render the PDF in the viewer.
+    Valid for 2 hours.
+    """
+    course = await cosmos_service.get_course(course_id, user_id=userId)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
+
+    pdf_url = course.get("pdfUrl")
+    if not pdf_url:
+        raise HTTPException(status_code=404, detail="No PDF attached to this course.")
+
+    try:
+        sas_url = get_blob_sas_url(pdf_url, expiry_hours=2)
+        return {"sasUrl": sas_url, "courseId": course_id}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate PDF access URL: {str(e)}"
+        )
