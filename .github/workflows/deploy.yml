@@ -39,9 +39,9 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure Container Apps
-        uses: azure/container-apps-deploy-action@v1
-        with:
-          containerAppName: ${{ env.CONTAINER_APP_NAME }}
-          resourceGroup: ${{ env.RESOURCE_GROUP }}
-          imageToDeploy: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - name: Deploy new image to Azure Container Apps
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
