@@ -1,91 +1,85 @@
+import random
 from fastapi import APIRouter, HTTPException
-from models.mcq import MCQGenerateRequest, MCQEvaluateRequest
+from models.mcq import MCQGenerateRequest, MCQEvaluateRequest, MCQQuestion, MCQOption
 from services import openai_service, cosmos_service
-from services.blob_service import get_blob_sas_url
-from services.pdf_service import render_pdf_pages_as_images
 
 router = APIRouter(prefix="/api/mcq", tags=["mcq"])
 
 
+@router.get("/bank/{course_id}")
+async def get_mcq_bank(course_id: str, userId: str = "nicolas"):
+    """
+    Return the full MCQ bank for a course.
+    Faculty can use this to review all questions.
+    """
+    mcqs = await cosmos_service.get_mcq_bank(course_id)
+    return {"mcqs": mcqs, "count": len(mcqs), "courseId": course_id}
+
+
 @router.post("/generate")
-async def generate_mcq(payload: MCQGenerateRequest):
+async def get_next_mcq(payload: MCQGenerateRequest):
     """
-    Generate one MCQ question grounded strictly in the course PDF.
-    Renders PDF pages as images so GPT sees charts, diagrams, and visuals.
-    Requires the course to have a PDF attached — returns 400 if not.
+    Return one MCQ from the pre-generated bank for this course.
+    Questions are served in random order.
+    Returns 400 if no PDF attached, 202 if still generating, 404 if bank is empty.
     """
 
-    # Step 1 — Get PDF URL from payload or Cosmos DB
-    course = None
-    pdf_url = payload.pdfUrl
+    # Fetch course to check status
+    course = await cosmos_service.get_course(payload.courseId)
 
-    if not pdf_url and payload.courseId:
-        course = await cosmos_service.get_course(payload.courseId)
-        if course:
-            pdf_url = course.get("pdfUrl")
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
 
-    # Step 2 — Block if no PDF attached
-    if not pdf_url:
+    if not course.get("pdfUrl"):
         raise HTTPException(
             status_code=400,
-            detail="No PDF attached to this course. Please upload a course document before generating questions."
+            detail="No PDF attached to this course. Please upload a course document first."
         )
 
-    # Step 3 — Get course title
-    course_title = payload.courseTitle
-    if not course_title:
-        if course:
-            course_title = course.get("title", "")
-        elif payload.courseId:
-            course = await cosmos_service.get_course(payload.courseId)
-            if course:
-                course_title = course.get("title", "")
+    mcq_status = course.get("mcqStatus", "none")
 
-    if not course_title:
-        raise HTTPException(status_code=400, detail="Course title is required.")
+    if mcq_status == "none":
+        raise HTTPException(
+            status_code=400,
+            detail="MCQ generation has not been triggered for this course."
+        )
 
-    # Step 4 — Generate SAS URL for secure PDF access
-    try:
-        sas_url = get_blob_sas_url(pdf_url, expiry_hours=1)
-    except Exception as e:
+    if mcq_status == "generating":
+        raise HTTPException(
+            status_code=202,
+            detail="Questions are being generated from your document. Please try again in a moment."
+        )
+
+    if mcq_status == "failed":
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to access course PDF: {str(e)}"
+            detail="MCQ generation failed for this course. Please re-upload the document."
         )
 
-    # Step 5 — Render PDF pages as images (max 10 pages, 150 DPI)
-    try:
-        pdf_images = await render_pdf_pages_as_images(
-            sas_url=sas_url,
-            max_pages=10,
-            dpi=150,
-        )
-    except Exception as e:
+    # Fetch the MCQ bank
+    bank = await cosmos_service.get_mcq_bank(payload.courseId)
+
+    if not bank:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to render PDF pages: {str(e)}"
+            status_code=404,
+            detail="No questions found for this course. The bank may still be loading."
         )
 
-    if not pdf_images:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not render any pages from the PDF."
-        )
+    # Pick a random question
+    item = random.choice(bank)
 
-    # Step 6 — Generate MCQ grounded in PDF page images
-    try:
-        mcq = await openai_service.generate_mcq(
-            course_title=course_title,
-            pdf_images=pdf_images,
-            course_id=payload.courseId,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate MCQ: {str(e)}"
-        )
+    options = [
+        MCQOption(letter=opt["letter"], text=opt["text"])
+        for opt in item["options"]
+    ]
 
-    return mcq
+    return MCQQuestion(
+        question=item["question"],
+        options=options,
+        correctIndex=item["correctIndex"],
+        explanation=item["explanation"],
+        courseId=payload.courseId,
+    )
 
 
 @router.post("/evaluate")
