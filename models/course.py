@@ -17,6 +17,8 @@ class CourseUpdate(BaseModel):
     status: Optional[str] = None
     exercisesDone: Optional[int] = None
     allowDownload: Optional[bool] = None
+    mcqStatus: Optional[str] = None
+    mcqCount: Optional[int] = None
 
 
 class Course(BaseModel):
@@ -30,6 +32,8 @@ class Course(BaseModel):
     exercisesTotal: int = 20
     exercisesDone: int = 0
     allowDownload: bool = True
+    mcqStatus: str = "none"     # none | generating | ready | failed
+    mcqCount: int = 0
     createdAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     updatedAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
@@ -45,5 +49,7 @@ class CourseResponse(BaseModel):
     exercisesTotal: int
     exercisesDone: int
     allowDownload: bool
+    mcqStatus: str
+    mcqCount: int
     createdAt: str
     updatedAt: str
