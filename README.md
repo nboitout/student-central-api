@@ -37,3 +37,5 @@ Backend deployed on Azure Container Apps.
 <!-- rebuild -->
 
 *.log
+
+New deployment
