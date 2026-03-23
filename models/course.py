@@ -10,11 +10,13 @@ class CourseCreate(BaseModel):
     source: str = ""
     userId: str = "nicolas"
     exercisesTotal: int = 20
+    allowDownload: Optional[bool] = True
 
 
 class CourseUpdate(BaseModel):
     status: Optional[str] = None
     exercisesDone: Optional[int] = None
+    allowDownload: Optional[bool] = None
 
 
 class Course(BaseModel):
@@ -27,6 +29,7 @@ class Course(BaseModel):
     status: str = "Not Started"
     exercisesTotal: int = 20
     exercisesDone: int = 0
+    allowDownload: bool = True
     createdAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     updatedAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
@@ -41,5 +44,6 @@ class CourseResponse(BaseModel):
     status: str
     exercisesTotal: int
     exercisesDone: int
+    allowDownload: bool
     createdAt: str
     updatedAt: str
