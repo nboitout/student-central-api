@@ -16,58 +16,81 @@ def get_deployment() -> str:
     return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2-chat")
 
 
-async def generate_mcq(
-    course_title: str,
-    pdf_images: list[str],  # list of base64-encoded PNG strings
-    course_id: str,
-) -> MCQQuestion:
-    """
-    Generate one MCQ question grounded strictly in the PDF page images.
-    GPT-5.2-chat sees the actual pages — including charts, diagrams, and visuals.
-    """
-    client = get_openai_client()
-    deployment = get_deployment()
+def _parse_json_response(raw_text: str) -> dict:
+    """Strip markdown fences and parse JSON from model output."""
+    raw_text = raw_text.strip()
+    if raw_text.startswith("```"):
+        parts = raw_text.split("```")
+        raw_text = parts[1] if len(parts) > 1 else raw_text
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:]
+    return json.loads(raw_text.strip())
 
-    json_instruction = (
-        "Respond ONLY with valid JSON in this exact format, no other text, "
-        "no markdown, no code fences:\n"
-        '{"question": "...", "options": ["option A text", "option B text", "option C text", "option D text"], '
-        '"correctIndex": 0, "explanation": "..."}\n'
-        "correctIndex is 0-based (0=A, 1=B, 2=C, 3=D).\n"
-        "The explanation must reference the specific content, figure, or concept from the document."
-    )
 
-    system_prompt = (
-        "You are an expert academic assessment designer. "
-        "You will receive pages from a course document as images. "
-        "Your task is to generate ONE high-quality multiple-choice question that:\n"
-        "- Is STRICTLY grounded in the provided document pages — including any charts, diagrams, or visuals\n"
-        "- Can only be answered correctly by someone who has read this specific document\n"
-        "- Tests deep conceptual understanding, not surface-level recall\n"
-        "- Has exactly 4 options (A, B, C, D)\n"
-        "- Has one clearly correct answer supported by the document\n"
-        "- Has 3 plausible distractors targeting common misconceptions about this specific content\n"
-        "- Is appropriate for a master's level student\n"
-        "- If the document contains visuals (charts, graphs, diagrams), consider testing understanding of those too\n"
-        + json_instruction
-    )
-
-    # Build content blocks: text instruction + one image per page
-    user_content = [
+def _build_image_content_blocks(pdf_images: list[str], course_title: str) -> list[dict]:
+    """Build the user content blocks: text intro + one image per page."""
+    content = [
         {
             "type": "text",
-            "text": f"Course: '{course_title}'\n\nHere are {len(pdf_images)} page(s) from the course document. Generate one MCQ strictly grounded in this content."
+            "text": (
+                f"Course: '{course_title}'\n\n"
+                f"Here are {len(pdf_images)} page(s) from the course document."
+            )
         }
     ]
-
-    for i, b64_image in enumerate(pdf_images):
-        user_content.append({
+    for b64_image in pdf_images:
+        content.append({
             "type": "image_url",
             "image_url": {
                 "url": f"data:image/png;base64,{b64_image}",
                 "detail": "high"
             }
         })
+    return content
+
+
+async def generate_mcq_bank(
+    course_title: str,
+    pdf_images: list[str],
+    course_id: str,
+    count: int = 10,
+) -> list[MCQQuestion]:
+    """
+    Generate a bank of `count` distinct MCQ questions from the PDF pages.
+    All questions are grounded strictly in the document content.
+    Called once at upload time — questions are stored in Cosmos DB.
+    """
+    client = get_openai_client()
+    deployment = get_deployment()
+
+    json_instruction = (
+        f"Respond ONLY with valid JSON — an array of exactly {count} question objects. "
+        "No other text, no markdown, no code fences. Format:\n"
+        f'[{{"question": "...", "options": ["A text", "B text", "C text", "D text"], '
+        '"correctIndex": 0, "explanation": "..."}, ...]\n'
+        "correctIndex is 0-based (0=A, 1=B, 2=C, 3=D).\n"
+        "Each explanation must reference the specific content from the document."
+    )
+
+    system_prompt = (
+        f"You are an expert academic assessment designer. "
+        f"You will receive pages from a course document as images. "
+        f"Generate exactly {count} DISTINCT high-quality multiple-choice questions that:\n"
+        "- Are STRICTLY grounded in the provided document — including charts, diagrams, visuals\n"
+        "- Can only be answered by someone who has read this specific document\n"
+        "- Cover different sections and concepts across the document (not repetitive)\n"
+        "- Test deep conceptual understanding at master's level\n"
+        "- Each has exactly 4 options (A, B, C, D)\n"
+        "- Each has one clearly correct answer supported by the document\n"
+        "- Each has 3 plausible distractors targeting common misconceptions\n"
+        "- Are varied in format: some conceptual, some applied, some analytical\n"
+        + json_instruction
+    )
+
+    user_content = _build_image_content_blocks(pdf_images, course_title)
+    user_content[0]["text"] += (
+        f"\n\nGenerate exactly {count} distinct MCQs strictly grounded in this document."
+    )
 
     response = client.chat.completions.create(
         model=deployment,
@@ -75,33 +98,44 @@ async def generate_mcq(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        max_completion_tokens=800,
+        max_completion_tokens=4000,  # more tokens needed for 10 questions
     )
 
-    raw_text = response.choices[0].message.content.strip()
+    raw = _parse_json_response(response.choices[0].message.content)
 
-    # Strip markdown fences if model wraps output
-    if raw_text.startswith("```"):
-        parts = raw_text.split("```")
-        raw_text = parts[1] if len(parts) > 1 else raw_text
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-    raw_text = raw_text.strip()
+    # raw is a list of question dicts
+    questions = []
+    for item in raw[:count]:  # safety cap
+        options = [
+            MCQOption(letter=["A", "B", "C", "D"][i], text=opt)
+            for i, opt in enumerate(item["options"])
+        ]
+        questions.append(MCQQuestion(
+            question=item["question"],
+            options=options,
+            correctIndex=item["correctIndex"],
+            explanation=item["explanation"],
+            courseId=course_id,
+        ))
 
-    raw = json.loads(raw_text)
+    return questions
 
-    options = [
-        MCQOption(letter=["A", "B", "C", "D"][i], text=opt)
-        for i, opt in enumerate(raw["options"])
-    ]
 
-    return MCQQuestion(
-        question=raw["question"],
-        options=options,
-        correctIndex=raw["correctIndex"],
-        explanation=raw["explanation"],
-        courseId=course_id,
+async def generate_mcq(
+    course_title: str,
+    pdf_images: list[str],
+    course_id: str,
+) -> MCQQuestion:
+    """
+    Generate a single MCQ — used as fallback if bank is not ready.
+    """
+    bank = await generate_mcq_bank(
+        course_title=course_title,
+        pdf_images=pdf_images,
+        course_id=course_id,
+        count=1,
     )
+    return bank[0]
 
 
 async def evaluate_reasoning(
@@ -144,8 +178,7 @@ async def evaluate_reasoning(
 
     opts_text = "\n".join([
         f"{['A','B','C','D'][i]}: {opt}"
-        for i, opt in enumerate(options)
-        if i < 4
+        for i, opt in enumerate(options) if i < 4
     ])
 
     user_content = (
@@ -166,17 +199,7 @@ async def evaluate_reasoning(
         max_completion_tokens=500,
     )
 
-    raw_text = response.choices[0].message.content.strip()
-
-    # Strip markdown fences if model wraps output
-    if raw_text.startswith("```"):
-        parts = raw_text.split("```")
-        raw_text = parts[1] if len(parts) > 1 else raw_text
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-    raw_text = raw_text.strip()
-
-    raw = json.loads(raw_text)
+    raw = _parse_json_response(response.choices[0].message.content)
 
     return ReasoningSignal(
         signal=raw["signal"],
