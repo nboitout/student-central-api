@@ -122,18 +122,32 @@ async def upload_course_pdf(file: UploadFile = File(...)):
 async def trigger_mcq_generation(
     background_tasks: BackgroundTasks,
     course_id: str,
-    pdf_url: str,
-    course_title: str,
     user_id: str = "nicolas",
+    pdf_url: str | None = None,
+    course_title: str | None = None,
 ):
     """
     Trigger background MCQ generation for a course after PDF is attached.
     Called by the frontend immediately after PATCH /api/courses/:id/pdf succeeds.
     Returns immediately — generation happens in the background.
+    pdf_url and course_title are optional — fetched from Cosmos DB if not provided.
     """
-    # Check if MCQs already exist
+    # Fetch course to fill in missing params and validate PDF exists
+    course = await cosmos_service.get_course(course_id, user_id=user_id)
+    if not course:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Course not found.")
+
+    resolved_pdf_url = pdf_url or course.get("pdfUrl")
+    resolved_title = course_title or course.get("title", "")
+
+    if not resolved_pdf_url:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="No PDF attached to this course.")
+
+    # Check if MCQs already exist and are ready
     existing = await cosmos_service.get_mcq_bank(course_id)
-    if existing:
+    if existing and course.get("mcqStatus") == "ready":
         return {"status": "already_generated", "count": len(existing)}
 
     # Queue background task
@@ -141,8 +155,8 @@ async def trigger_mcq_generation(
         _generate_and_store_mcqs,
         course_id=course_id,
         user_id=user_id,
-        pdf_url=pdf_url,
-        course_title=course_title,
+        pdf_url=resolved_pdf_url,
+        course_title=resolved_title,
     )
 
     return {"status": "generating", "message": "MCQ generation started in background"}
