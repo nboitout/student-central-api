@@ -1,6 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from services.blob_service import upload_pdf, get_blob_sas_url
-from services.pdf_service import render_pdf_pages_as_images
+from services.pdf_service import render_and_store_pdf_pages, render_pdf_pages_as_images
 from services.openai_service import generate_mcq_bank
 from services import cosmos_service
 from models.mcq import StoredMCQ
@@ -19,31 +19,38 @@ async def _generate_and_store_mcqs(
     course_title: str,
 ):
     """
-    Background task: render PDF pages as images, generate 10 MCQs,
-    store them in Cosmos DB, and update the course mcqStatus.
+    Background task:
+    1. Render PDF pages as images — store each page PNG in Blob Storage
+    2. Pass images to GPT-5.2-chat — generate 10 MCQs with pageNumber
+    3. Store MCQs in Cosmos DB with slideImageUrl
+    4. Update course mcqStatus
     """
     try:
-        # Mark as generating
         await cosmos_service.update_course(
-            course_id,
-            CourseUpdate(mcqStatus="generating"),
-            user_id=user_id,
+            course_id, CourseUpdate(mcqStatus="generating"), user_id=user_id
         )
 
-        # Generate SAS URL for PDF access
         sas_url = get_blob_sas_url(pdf_url, expiry_hours=2)
 
-        # Render PDF pages as images
-        pdf_images = await render_pdf_pages_as_images(
+        # Render pages and store in Blob Storage
+        page_url_map = await render_and_store_pdf_pages(
             sas_url=sas_url,
-            max_pages=10,
+            course_id=course_id,
+            max_pages=MCQ_COUNT,
             dpi=150,
         )
 
-        if not pdf_images:
+        if not page_url_map:
             raise ValueError("No pages rendered from PDF")
 
-        # Generate MCQ bank
+        # Build base64 list for GPT (re-render in memory — avoids SAS complexity)
+        pdf_images = await render_pdf_pages_as_images(
+            sas_url=sas_url,
+            max_pages=MCQ_COUNT,
+            dpi=150,
+        )
+
+        # Generate MCQ bank with pageNumber
         questions = await generate_mcq_bank(
             course_title=course_title,
             pdf_images=pdf_images,
@@ -51,7 +58,10 @@ async def _generate_and_store_mcqs(
             count=MCQ_COUNT,
         )
 
-        # Store MCQs in Cosmos DB
+        # Build page_number → blob_url lookup
+        page_url_lookup = {page_num: url for page_num, url in page_url_map}
+
+        # Store MCQs with slideImageUrl
         stored_mcqs = [
             StoredMCQ(
                 courseId=course_id,
@@ -60,12 +70,14 @@ async def _generate_and_store_mcqs(
                 options=q.options,
                 correctIndex=q.correctIndex,
                 explanation=q.explanation,
+                pageNumber=q.pageNumber,
+                slideImageUrl=page_url_lookup.get(q.pageNumber or 0),
             )
             for q in questions
         ]
+
         saved_count = await cosmos_service.save_mcq_bank(stored_mcqs)
 
-        # Update course: mcqStatus=ready, mcqCount=saved
         await cosmos_service.update_course(
             course_id,
             CourseUpdate(mcqStatus="ready", mcqCount=saved_count),
@@ -78,9 +90,7 @@ async def _generate_and_store_mcqs(
         print(f"MCQ generation failed for course {course_id}: {e}")
         try:
             await cosmos_service.update_course(
-                course_id,
-                CourseUpdate(mcqStatus="failed"),
-                user_id=user_id,
+                course_id, CourseUpdate(mcqStatus="failed"), user_id=user_id
             )
         except Exception:
             pass
@@ -88,34 +98,20 @@ async def _generate_and_store_mcqs(
 
 @router.post("")
 async def upload_course_pdf(file: UploadFile = File(...)):
-    """
-    Upload a PDF file to Azure Blob Storage.
-    Returns the permanent blob URL to store with the course record.
-    """
+    """Upload a PDF to Azure Blob Storage. Returns the blob URL."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
     contents = await file.read()
 
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB."
-        )
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
 
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="File is empty.")
 
-    blob_url = await upload_pdf(
-        file_bytes=contents,
-        original_filename=file.filename,
-    )
-
-    return {
-        "url": blob_url,
-        "filename": file.filename,
-        "size": len(contents),
-    }
+    blob_url = await upload_pdf(file_bytes=contents, original_filename=file.filename)
+    return {"url": blob_url, "filename": file.filename, "size": len(contents)}
 
 
 @router.post("/trigger-mcq-generation")
@@ -128,29 +124,23 @@ async def trigger_mcq_generation(
 ):
     """
     Trigger background MCQ generation for a course after PDF is attached.
-    Called by the frontend immediately after PATCH /api/courses/:id/pdf succeeds.
-    Returns immediately — generation happens in the background.
     pdf_url and course_title are optional — fetched from Cosmos DB if not provided.
+    Returns immediately — generation happens in the background.
     """
-    # Fetch course to fill in missing params and validate PDF exists
     course = await cosmos_service.get_course(course_id, user_id=user_id)
     if not course:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Course not found.")
 
     resolved_pdf_url = pdf_url or course.get("pdfUrl")
     resolved_title = course_title or course.get("title", "")
 
     if not resolved_pdf_url:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="No PDF attached to this course.")
 
-    # Check if MCQs already exist and are ready
     existing = await cosmos_service.get_mcq_bank(course_id)
     if existing and course.get("mcqStatus") == "ready":
         return {"status": "already_generated", "count": len(existing)}
 
-    # Queue background task
     background_tasks.add_task(
         _generate_and_store_mcqs,
         course_id=course_id,
