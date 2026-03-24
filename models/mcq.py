@@ -16,11 +16,14 @@ class MCQOption(BaseModel):
 
 
 class MCQQuestion(BaseModel):
+    mcqId: Optional[str] = None      # set after storing in DB
     question: str
     options: list[MCQOption]
     correctIndex: int
     explanation: str
     courseId: str
+    pageNumber: Optional[int] = None  # 0-based PDF page index
+    slideImageUrl: Optional[str] = None  # private blob URL (use /slide endpoint for SAS)
 
 
 class StoredMCQ(BaseModel):
@@ -32,6 +35,8 @@ class StoredMCQ(BaseModel):
     options: list[MCQOption]
     correctIndex: int
     explanation: str
+    pageNumber: Optional[int] = None
+    slideImageUrl: Optional[str] = None
     createdAt: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
