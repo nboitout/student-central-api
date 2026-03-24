@@ -16,14 +16,30 @@ def get_deployment() -> str:
     return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2-chat")
 
 
-def _parse_json_response(raw_text: str) -> dict:
-    """Strip markdown fences and parse JSON from model output."""
+def _parse_json_response(raw_text: str) -> dict | list:
+    """Strip markdown fences and extra text, then parse JSON from model output."""
     raw_text = raw_text.strip()
+
+    # Strip markdown fences
     if raw_text.startswith("```"):
         parts = raw_text.split("```")
         raw_text = parts[1] if len(parts) > 1 else raw_text
         if raw_text.startswith("json"):
             raw_text = raw_text[4:]
+    raw_text = raw_text.strip()
+
+    # For arrays — extract everything between first [ and last ]
+    if raw_text.startswith("["):
+        last_bracket = raw_text.rfind("]")
+        if last_bracket != -1:
+            raw_text = raw_text[:last_bracket + 1]
+
+    # For objects — extract everything between first { and last }
+    elif raw_text.startswith("{"):
+        last_brace = raw_text.rfind("}")
+        if last_brace != -1:
+            raw_text = raw_text[:last_brace + 1]
+
     return json.loads(raw_text.strip())
 
 
