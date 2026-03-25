@@ -9,7 +9,7 @@ from models.course import CourseUpdate
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-MCQ_COUNT = 10
+MCQ_COUNT = 20
 
 
 async def _generate_and_store_mcqs(
