@@ -14,7 +14,6 @@ def get_deployment() -> str:
     return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2-chat")
 
 
-# BCP-47 → human-readable language name for the system prompt
 LANGUAGE_NAMES = {
     "en": "English", "fr": "French", "de": "German", "es": "Spanish",
     "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
@@ -40,35 +39,53 @@ def _build_system_prompt(
     opts_text = "\n".join([f"{['A','B','C','D'][i]}: {opt}" for i, opt in enumerate(options) if i < 4])
 
     turn_guidance = {
-        1: "Surface the student's belief — ask what reasoning led them to their answer.",
-        2: "Challenge one assumption in the student's last message — ask them to examine it.",
-        3: "Ask the student to apply the concept to a different scenario or context.",
-        4: "Ask the student to compare their chosen option with the other distractors.",
-        5: "Ask the student to synthesise their understanding in one sentence.",
-    }.get(turn_number, "Continue the Socratic dialogue, pushing one level deeper.")
+        1: "Ask what drew them to their answer. Keep it open. You want to hear them think out loud.",
+        2: "Pick up on something specific they just said. Ask them to say more about that one thing.",
+        3: "Ask them how this would play out in a concrete situation. Help them see the idea in action.",
+        4: "Ask them how their answer compares to one of the other options. Which felt close? Why?",
+        5: "Ask them to put it in their own words — one sentence. What did they take away from this?",
+    }.get(turn_number, "Follow their last thought. Ask the one question that moves it forward.")
 
-    return f"""You are a Socratic AI tutor helping a master's student reflect on their understanding of a course concept.
+    if is_correct:
+        opening_context = (
+            "The student got it right. Your job is not to congratulate them — "
+            "it's to find out if they really understood or just got lucky. "
+            "Invite them to explain their thinking."
+        )
+    else:
+        opening_context = (
+            "The student got it wrong. Do not tell them. Do not hint. "
+            "Invite them to explain what they were thinking. "
+            "You're not correcting them — you're listening."
+        )
+
+    return f"""You are a tutor having a short, warm conversation with a master's student.
 
 QUESTION: {question}
 
 OPTIONS:
 {opts_text}
 
-THE STUDENT SELECTED: {selected_text} ({'CORRECT' if is_correct else 'INCORRECT'})
+STUDENT SELECTED: {selected_text}
 
-COURSE EXPLANATION (for your reference only — do NOT share this with the student):
+{opening_context}
+
+COURSE EXPLANATION — for your reference only, never share this:
 {explanation}
 
-YOUR RULES — follow all of these without exception:
-1. Respond ONLY in {lang_name}
-2. Ask EXACTLY ONE question per reply — never two
-3. NEVER reveal the correct answer — let the student arrive there themselves
-4. NEVER evaluate the student's reasoning — that happens separately after the chat
-5. NEVER lecture, explain, or confirm — only probe with questions
-6. Stay grounded to this specific question and its options — do not wander
-7. Be warm but intellectually rigorous — treat the student as a capable adult
+HOW YOU TALK:
+- Short sentences. Conversational. Never academic.
+- One question per message. Always exactly one.
+- Warm but not effusive. You're interested in what they think.
+- Never say "great", "excellent", "good point" — it sounds hollow.
+- Never explain the concept. Never correct them. Never reveal the answer.
+- Never evaluate their reasoning — that happens separately.
+- Your only job: help them put their thoughts into words.
+- When they articulate something — even partially — they feel it. That feeling of "I can explain this" is what you're building toward.
 
-CURRENT TURN GUIDANCE: {turn_guidance}"""
+LANGUAGE: Respond only in {lang_name}.
+
+CURRENT FOCUS: {turn_guidance}"""
 
 
 async def generate_probe(
@@ -80,10 +97,6 @@ async def generate_probe(
     explanation: str,
     language: str,
 ) -> str:
-    """
-    Generate the opening Socratic probe — the tutor's first message.
-    Surfaces the student's reasoning without revealing the correct answer.
-    """
     client = get_openai_client()
     deployment = get_deployment()
 
@@ -101,18 +114,16 @@ async def generate_probe(
     selected_text = options[selected_index] if selected_index < len(options) else "unknown"
     option_letter = ["A", "B", "C", "D"][selected_index] if selected_index < 4 else "?"
 
-    user_message = (
-        f"The student just answered the question by selecting option {option_letter}: '{selected_text}'. "
-        f"Generate your opening probe to begin the Socratic dialogue."
-    )
-
     response = client.chat.completions.create(
         model=deployment,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": (
+                f"The student answered the question and selected option {option_letter}: '{selected_text}'. "
+                "Open the conversation."
+            )},
         ],
-        max_completion_tokens=200,
+        max_completion_tokens=120,
     )
 
     return response.choices[0].message.content.strip()
@@ -128,13 +139,9 @@ async def generate_reply(
     language: str,
     history: list[dict],
 ) -> str:
-    """
-    Generate the tutor's next Socratic reply based on the conversation history.
-    """
     client = get_openai_client()
     deployment = get_deployment()
 
-    # Turn number = number of AI messages already sent + 1
     turn_number = sum(1 for m in history if m["role"] == "ai") + 1
 
     system_prompt = _build_system_prompt(
@@ -148,7 +155,6 @@ async def generate_reply(
         turn_number=min(turn_number, 5),
     )
 
-    # Build conversation messages from history
     messages = [{"role": "system", "content": system_prompt}]
     for msg in history:
         role = "assistant" if msg["role"] == "ai" else "user"
@@ -157,7 +163,7 @@ async def generate_reply(
     response = client.chat.completions.create(
         model=deployment,
         messages=messages,
-        max_completion_tokens=200,
+        max_completion_tokens=120,
     )
 
     return response.choices[0].message.content.strip()
