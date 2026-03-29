@@ -12,47 +12,57 @@ from services.blob_service import get_blob_sas_url
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-def _build_question_payload(q, drawn_mcq: dict | None = None) -> dict:
+def _get_sas_url(raw_url: str | None) -> str | None:
+    """Convert a private blob URL to a 2-hour SAS URL. Returns None on failure."""
+    if not raw_url:
+        return None
+    try:
+        return get_blob_sas_url(raw_url, expiry_hours=2)
+    except Exception:
+        return None
+
+
+def _build_question_payload(session_q: dict, mcq_bank_item: dict | None = None) -> dict:
     """
     Build the question payload sent to the frontend.
-    Converts the private slideImageUrl blob URL to a 2-hour SAS URL.
+    Priority for slideImageUrl:
+      1. mcq_bank_item (freshest source — has slideImageUrl from generation time)
+      2. session_q dict (stored at session creation — may be null for old sessions)
+    Converts private blob URL to 2-hour SAS URL.
     Uses snake_case keys to match frontend expectations.
     """
-    # Get slideImageUrl from either the QuestionRecord or the raw drawn MCQ
-    slide_image_url = None
-    page_number = q.pageNumber if hasattr(q, "pageNumber") else q.get("pageNumber")
-
-    raw_slide_url = None
-    if hasattr(q, "pageNumber"):
-        # QuestionRecord object — slideImageUrl not stored on it directly
-        # get it from the drawn MCQ dict if available
-        if drawn_mcq:
-            raw_slide_url = drawn_mcq.get("slideImageUrl")
-    else:
-        # dict from Cosmos DB
-        raw_slide_url = q.get("slideImageUrl")
-
-    if raw_slide_url:
-        try:
-            slide_image_url = get_blob_sas_url(raw_slide_url, expiry_hours=2)
-        except Exception:
-            slide_image_url = None
-
-    position = q.position if hasattr(q, "position") else q.get("position")
-    mcq_id   = q.mcqId    if hasattr(q, "mcqId")    else q.get("mcqId")
-    question = q.question  if hasattr(q, "question")  else q.get("question")
-    options  = q.options   if hasattr(q, "options")   else q.get("options")
-    correct  = q.correctIndex if hasattr(q, "correctIndex") else q.get("correctIndex")
+    # Resolve slideImageUrl — prefer MCQ bank over session record
+    raw_slide_url = (
+        (mcq_bank_item or {}).get("slideImageUrl")
+        or session_q.get("slideImageUrl")
+        or session_q.get("slide_image_url")
+    )
 
     return {
-        "position":        position,
-        "mcqId":           mcq_id,
-        "question":        question,
-        "options":         options,
-        "correctIndex":    correct,
-        "page_number":     page_number,
-        "slide_image_url": slide_image_url,
+        "position":        session_q.get("position"),
+        "mcqId":           session_q.get("mcqId"),
+        "question":        session_q.get("question"),
+        "options":         session_q.get("options"),
+        "correctIndex":    session_q.get("correctIndex"),
+        "page_number":     (
+            (mcq_bank_item or {}).get("pageNumber")
+            or session_q.get("pageNumber")
+            or session_q.get("page_number")
+        ),
+        "slide_image_url": _get_sas_url(raw_slide_url),
     }
+
+
+async def _fetch_mcq_bank_item(mcq_id: str, course_id: str) -> dict | None:
+    """Fetch a single MCQ from the bank by ID."""
+    if not mcq_id:
+        return None
+    try:
+        from services.cosmos_service import get_mcqs_container
+        container = get_mcqs_container()
+        return container.read_item(item=mcq_id, partition_key=course_id)
+    except Exception:
+        return None
 
 
 @router.post("")
@@ -72,8 +82,7 @@ async def create_session(payload: SessionCreateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    first = session.questions[0]
-    # drawn[0] is the raw MCQ dict with slideImageUrl
+    first_q = session.questions[0].model_dump()
     first_drawn = drawn[0] if drawn else None
 
     return {
@@ -81,7 +90,7 @@ async def create_session(payload: SessionCreateRequest):
         "mode":           session.mode,
         "language":       session.language,
         "totalQuestions": len(session.questions),
-        "question":       _build_question_payload(first, first_drawn),
+        "question":       _build_question_payload(first_q, first_drawn),
     }
 
 
@@ -105,29 +114,25 @@ async def get_question(session_id: str, position: int, courseId: str):
     """
     Return the question at a given position with a fresh SAS URL for the slide.
     Called when the frontend advances to Q2, Q3, Q4, Q5.
+    Always fetches slideImageUrl from the MCQ bank to ensure freshness.
     """
     session = await session_service.get_session(session_id, courseId)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    question = next(
+    session_q = next(
         (q for q in session["questions"] if q["position"] == position), None
     )
-    if not question:
+    if not session_q:
         raise HTTPException(status_code=404, detail=f"Question {position} not found.")
 
-    # Fetch the raw MCQ from the bank to get slideImageUrl
-    from services.cosmos_service import get_mcqs_container
-    mcq_id = question.get("mcqId")
-    drawn_mcq = None
-    if mcq_id:
-        try:
-            container = get_mcqs_container()
-            drawn_mcq = container.read_item(item=mcq_id, partition_key=courseId)
-        except Exception:
-            drawn_mcq = None
+    # Always fetch from MCQ bank for freshest slideImageUrl
+    mcq_bank_item = await _fetch_mcq_bank_item(
+        mcq_id=session_q.get("mcqId"),
+        course_id=courseId,
+    )
 
-    return _build_question_payload(question, drawn_mcq)
+    return _build_question_payload(session_q, mcq_bank_item)
 
 
 @router.patch("/{session_id}/answer")
