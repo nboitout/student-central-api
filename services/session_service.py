@@ -91,6 +91,7 @@ async def create_session(
             options=[opt["text"] for opt in q["options"]],
             correctIndex=q["correctIndex"],
             pageNumber=q.get("pageNumber"),
+            slideImageUrl=q.get("slideImageUrl"),
         )
         for i, q in enumerate(drawn)
     ]
